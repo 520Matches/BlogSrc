@@ -11,3 +11,115 @@
 ### 万一非要在中断中延时或者影响中断处理效率的操作怎么办？
 - 早有骨灰级大神给我们想好办法了，那就是把中断分成上半部和下半部，上半部负责处理快速的必要的处理，下半部则在可以做一些稍微复杂的操作。
 
+- 啥？听说中断下半部分能做稍微复杂一点的操作？？？那么是怎么实现的呢？一脸的？？？
+
+###  中断下半部分实现？
+
+中断下半部机制 | 现在的使用情况  
+-|-
+~~BH~~ | 已经被淘汰了（凉凉）
+~~任务队列（Task queues）~~ | 已经被淘汰了（凉凉）
+软中断（Softirq） | 有用
+tasklet | 有用
+工作队列（Work queues） | 有用
+
+1. 由上表可得，我们只要看下面3中实现方式就可以了，是不是很开心，哈哈哈。
+2. 由于软中断（Softirq)和tasklet的实现方式很像，但是tasklet得接口更好用，所以又把软中断淘汰掉了，哇偶，又少了一个，开心！！！
+
+###  中断下半部分有什么软用？
+
+- 不好意思，它真的有点软用，哈哈哈。江湖规矩具体例子来说明。
+- 现在我有一块**网卡**（又是你，怎么又是你**网卡**，不好意思，小编今天就想拿你开刀），我呢想打游戏，家里的网速的100M很快，网卡会在接受到网络数据的时候产生一个中断来告诉CPU，嗨CPU，我有网络数据了，你快来处理一下。这时候CPU就进入了这个中断来处理网络数据了，但是在处理的时候又有新的网络数据来了，这个时候网卡再发出中断，由于CPU还在处理上一个网络数据，所以网卡只能把数据放在自带的缓冲中，但是缓冲有限，存满了以后要是还有新的网络数据来就直接丢弃了，这样就导致了网络丢包，以至于我团战还没开始就结束了，很难受。（TODO）
+
+#### tasklet是怎么实现的？
+
+- tasklet由`tasklet_struct`这个结构体表示，一个结构体对象表示一个tasklet，多个tasklet组成一个链表，然后内核会在何时的时间去遍历这个链表，并找出符合条件的tasklet来执行，在执行的时候顺便把状态改成正在执行状态，这样在多核系统中，其它的处理器就不会再去执行了，执行完以后再把正在执行状态清除。这样一次完整的处理就OK了。同学们看到这里肯定觉得so easy是不是？你说不是我弄死你，哈哈哈。下面就从代码角度来看看吧，嘻嘻。
+
+```C
+struct tasklet_struct{
+	//next这个指针用来指向链表中的下一个tasklet_struct
+	struct tasklet_struct *next;
+	//state表示当前这个tasklet的状态
+	unsigned long state;
+	//count是一个当前tasklet的引用计数器，用atomic_t定义表示改变量需要用原子操作
+	atomic_t count;
+	//tasklet的实际处理函数
+	void (*func)(unsigned long);
+	//传递给func函数的参数，用unsigned long做参数的话就可以传递指针了，内核的骨灰级大佬早就想好了的。
+	unsigned long data;
+};
+```
+> **说明一下：**
+> 只有当*count*为0的时候tasklet对象才有可能被执行。
+
+```C
+//这个宏是创建一个tasklet
+DECLARE_TASKLET(name, func, data);
+
+//这个宏是删除一个tasklet
+DECLARE_TASKLET_DISABLED(name, func, data);
+```
+- 万事具备，只欠自己动手写代码了
+
+```C
+...
+struct cdev tasklet_cdev;
+
+//tasklet的具体执行函数，就是每次进来打印一下第几次进来，打印一下参数
+static void fun_tasklet(unsigned long arg)
+{
+	static int num = 0;
+	printk("num=%d,fun tasklet arg=%lld\n",num,arg);
+	num++;
+}
+
+//创建一个tasklet结构
+DECLARE_TASKLET(Tasklet,fun_tasklet,(unsigned long)8888);
+
+...
+
+//中断发生的时候会调用的函数
+static irqreturn_t tasklet_handler(int irq,void *dev_id)
+{
+	//调度tasklet
+	tasklet_schedule(&Tasklet);
+
+	return IRQ_HANDLED;
+}
+
+...
+
+static int __init my_tasklet_init(void)
+{
+...
+
+	//注册中断，我这里用网卡来模拟，我的电脑的网卡中断号是19，可以通过`cat /proc/interrupts`命令来查看linux的中断信息**IRQF_TRIGGER_HIGH**表示高电平出发，**IRQF_SHARED**表示共享中断
+	ret = request_irq(19,tasklet_handler,IRQF_TRIGGER_HIGH | IRQF_SHARED,TASKLET_DEV_NAME,&tasklet_cdev);
+	
+...
+}
+
+static void __exit my_tasklet_exit(void)
+{
+	dev_t dev;
+
+	printk("tasklet exit...");
+
+	dev = MKDEV(TASKLET_MAJOR,TASKLET_MINOR);
+	//释放中断
+	free_irq(19,&tasklet_cdev);
+	cdev_del(&tasklet_cdev);
+	unregister_chrdev_region(dev,TASKLET_DEV_CNT);
+}
+
+...
+```
+- 由于是驱动程序，所以需要把代码编译成.ko文件，然后insmod上去（当然先要更具代码注册设备节点）最后你在启动浏览器，随便打开一个网页，就会产生很多网络中断。通过dmesg命令可以看到我们的网络中断程序被执行了，perfect。
+- 贴图
+
+## 结尾
+
+- 源码在github中的地址 [https://github.com/520Matches/CoderStudy](https://github.com/520Matches/CoderStudy)
+- 意见反馈邮箱 **HengDi_Sun@163.com**
+
+
